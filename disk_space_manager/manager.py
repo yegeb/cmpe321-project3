@@ -12,9 +12,10 @@ Each relation and each index is stored as a separate binary file named
 
 Free-space tracking
 ────────────────────
-A companion metadata file '<file_id>.meta' stores a simple free-list as a
-JSON array of free page_ids.  When allocate_page() is called, the list is
-checked first; if empty, the file is extended by one page.
+Free slots within pages are tracked by slot bitmaps maintained by the
+FileIndexManager (one bit per slot in the page header).  At the page
+level, allocate_page() simply appends a new zeroed page to the file;
+no page is ever freed back to the disk layer.
 
 I/O counting
 ─────────────
@@ -22,7 +23,6 @@ read_count and write_count are incremented on every actual disk operation.
 BufferManager reads these via get_stats().
 """
 
-import json
 import os
 
 from shared.results import PageResult, WriteResult, AllocResult
@@ -35,7 +35,7 @@ class DiskSpaceManager:
         self.page_size: int = config["page_size"]
 
         # Directory where archive.py lives – all files written here.
-        self._base_dir: str = os.path.dirname(os.path.abspath(__file__ + "/../../archive.py"))
+        self._base_dir: str = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
         self.read_count: int = 0
         self.write_count: int = 0
@@ -51,31 +51,6 @@ class DiskSpaceManager:
 
     def _ensure_parent_dir(self) -> None:
         os.makedirs(self._base_dir, exist_ok=True)
-
-    def _read_free_list(self, file_id: str) -> list[int]:
-        meta_path = self._meta_path(file_id)
-        if not os.path.exists(meta_path):
-            return []
-
-        try:
-            with open(meta_path, "r", encoding="ascii") as meta_file:
-                data = json.load(meta_file)
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return []
-
-        if not isinstance(data, list):
-            return []
-
-        free_list: list[int] = []
-        for item in data:
-            if isinstance(item, int) and item >= 0:
-                free_list.append(item)
-        return free_list
-
-    def _write_free_list(self, file_id: str, free_list: list[int]) -> None:
-        meta_path = self._meta_path(file_id)
-        with open(meta_path, "w", encoding="ascii") as meta_file:
-            json.dump(free_list, meta_file)
 
     def _page_offset(self, page_id: int) -> int:
         return page_id * self.page_size
@@ -104,30 +79,18 @@ class DiskSpaceManager:
     def _file_path(self, file_id: str) -> str:
         return os.path.join(self._base_dir, f"{file_id}.db")
 
-    def _meta_path(self, file_id: str) -> str:
-        return os.path.join(self._base_dir, f"{file_id}.meta")
-
     def create_file(self, file_id: str) -> bool:
         """
-        Create the binary file and its companion meta file if they don't exist.
-        Returns True if created, False if already existed.
+        Create the binary file if it doesn't exist.
+        Returns True if a new file was created, False if it already existed.
         """
         self._ensure_parent_dir()
-
         file_path = self._file_path(file_id)
-        meta_path = self._meta_path(file_id)
-        created = False
-
         if not os.path.exists(file_path):
             with open(file_path, "wb"):
                 pass
-            created = True
-
-        if not os.path.exists(meta_path):
-            self._write_free_list(file_id, [])
-            created = True or created
-
-        return created
+            return True
+        return False
 
     def file_exists(self, file_id: str) -> bool:
         """Return True if the file for file_id exists on disk."""
@@ -138,7 +101,6 @@ class DiskSpaceManager:
         file_path = self._file_path(file_id)
         if not os.path.exists(file_path):
             return 0
-
         size = os.path.getsize(file_path)
         return size // self.page_size
 
@@ -297,38 +259,16 @@ class DiskSpaceManager:
 
     def allocate_page(self, file_id: str) -> AllocResult:
         """
-        Extend file_id by one page and return the new page's id.
-        The new page is zeroed (b'\\x00' * page_size).
+        Append a new zeroed page to file_id and return its page_id.
         Creates the file if it does not yet exist.
 
         Returns AllocResult(success=False) on I/O error.
         """
         try:
             self.create_file(file_id)
-            free_list = self._read_free_list(file_id)
-
-            if free_list:
-                page_id = free_list.pop(0)
-                self._write_free_list(file_id, free_list)
-                write_result = self.write_page(file_id, page_id, self._zero_page())
-                if not write_result.success:
-                    return AllocResult(
-                        success=False,
-                        status="error",
-                        page_id=page_id,
-                        file_id=file_id,
-                        error_msg=write_result.error_msg,
-                    )
-                return AllocResult(
-                    success=True,
-                    status="success",
-                    page_id=page_id,
-                    file_id=file_id,
-                    error_msg="",
-                )
-
             file_path = self._file_path(file_id)
             page_id = self.get_page_count(file_id)
+
             with open(file_path, "ab") as data_file:
                 data_file.write(self._zero_page())
                 data_file.flush()
