@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local test / smoke-test database artifacts
+_*.db
+_*.meta
+
+# Generated runtime outputs
+output.txt
+stats_output.txt
+log.csv
+
+# Generated workload files
+workloads/
+*.tmp
