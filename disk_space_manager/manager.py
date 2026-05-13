@@ -22,6 +22,7 @@ read_count and write_count are incremented on every actual disk operation.
 BufferManager reads these via get_stats().
 """
 
+import json
 import os
 
 from shared.results import PageResult, WriteResult, AllocResult
@@ -42,6 +43,48 @@ class DiskSpaceManager:
         # log_write hook – replaced by a real implementation if needed.
         # Must be called on every write (currently a no-op).
         self._log_write_hook = None
+
+    # ─── Internal helpers ─────────────────────────────────────────────────────
+
+    def _zero_page(self) -> bytes:
+        return b"\x00" * self.page_size
+
+    def _ensure_parent_dir(self) -> None:
+        os.makedirs(self._base_dir, exist_ok=True)
+
+    def _read_free_list(self, file_id: str) -> list[int]:
+        meta_path = self._meta_path(file_id)
+        if not os.path.exists(meta_path):
+            return []
+
+        try:
+            with open(meta_path, "r", encoding="ascii") as meta_file:
+                data = json.load(meta_file)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return []
+
+        if not isinstance(data, list):
+            return []
+
+        free_list: list[int] = []
+        for item in data:
+            if isinstance(item, int) and item >= 0:
+                free_list.append(item)
+        return free_list
+
+    def _write_free_list(self, file_id: str, free_list: list[int]) -> None:
+        meta_path = self._meta_path(file_id)
+        with open(meta_path, "w", encoding="ascii") as meta_file:
+            json.dump(free_list, meta_file)
+
+    def _page_offset(self, page_id: int) -> int:
+        return page_id * self.page_size
+
+    def _read_page_bytes_no_count(self, file_id: str, page_id: int) -> bytes:
+        file_path = self._file_path(file_id)
+        with open(file_path, "rb") as data_file:
+            data_file.seek(self._page_offset(page_id))
+            return data_file.read(self.page_size)
 
     # ─── Public log_write stub ────────────────────────────────────────────────
 
@@ -69,15 +112,35 @@ class DiskSpaceManager:
         Create the binary file and its companion meta file if they don't exist.
         Returns True if created, False if already existed.
         """
-        raise NotImplementedError
+        self._ensure_parent_dir()
+
+        file_path = self._file_path(file_id)
+        meta_path = self._meta_path(file_id)
+        created = False
+
+        if not os.path.exists(file_path):
+            with open(file_path, "wb"):
+                pass
+            created = True
+
+        if not os.path.exists(meta_path):
+            self._write_free_list(file_id, [])
+            created = True or created
+
+        return created
 
     def file_exists(self, file_id: str) -> bool:
         """Return True if the file for file_id exists on disk."""
-        raise NotImplementedError
+        return os.path.exists(self._file_path(file_id))
 
     def get_page_count(self, file_id: str) -> int:
         """Return the total number of pages currently in the file."""
-        raise NotImplementedError
+        file_path = self._file_path(file_id)
+        if not os.path.exists(file_path):
+            return 0
+
+        size = os.path.getsize(file_path)
+        return size // self.page_size
 
     # ─── Core I/O ─────────────────────────────────────────────────────────────
 
@@ -90,7 +153,62 @@ class DiskSpaceManager:
         Returns PageResult(status="error") if file does not exist or
         page_id is out of range.
         """
-        raise NotImplementedError
+        if page_id < 0:
+            return PageResult(
+                data=b"",
+                page_id=page_id,
+                file_id=file_id,
+                io_performed=False,
+                status="error",
+                error_msg="page_id must be non-negative",
+            )
+
+        if not self.file_exists(file_id):
+            return PageResult(
+                data=b"",
+                page_id=page_id,
+                file_id=file_id,
+                io_performed=False,
+                status="error",
+                error_msg="file does not exist",
+            )
+
+        page_count = self.get_page_count(file_id)
+        if page_id >= page_count:
+            return PageResult(
+                data=b"",
+                page_id=page_id,
+                file_id=file_id,
+                io_performed=False,
+                status="error",
+                error_msg="page_id out of range",
+            )
+
+        file_path = self._file_path(file_id)
+        with open(file_path, "rb") as data_file:
+            data_file.seek(self._page_offset(page_id))
+            data = data_file.read(self.page_size)
+
+        self.read_count += 1
+
+        if len(data) != self.page_size:
+            return PageResult(
+                data=data,
+                page_id=page_id,
+                file_id=file_id,
+                io_performed=True,
+                status="error",
+                error_msg="short read",
+            )
+
+        return PageResult(
+            data=data,
+            page_id=page_id,
+            file_id=file_id,
+            io_performed=True,
+            status="success",
+            error_msg="",
+        )
 
     def write_page(self, file_id: str, page_id: int, data: bytes) -> WriteResult:
         """
@@ -101,7 +219,81 @@ class DiskSpaceManager:
         Returns WriteResult(success=False) if file does not exist or
         page_id is out of range.
         """
-        raise NotImplementedError
+        if page_id < 0:
+            return WriteResult(
+                success=False,
+                status="error",
+                page_id=page_id,
+                file_id=file_id,
+                old_data=b"",
+                new_data=data,
+                error_msg="page_id must be non-negative",
+            )
+
+        if len(data) != self.page_size:
+            return WriteResult(
+                success=False,
+                status="error",
+                page_id=page_id,
+                file_id=file_id,
+                old_data=b"",
+                new_data=data,
+                error_msg="data length must equal page_size",
+            )
+
+        if not self.file_exists(file_id):
+            return WriteResult(
+                success=False,
+                status="error",
+                page_id=page_id,
+                file_id=file_id,
+                old_data=b"",
+                new_data=data,
+                error_msg="file does not exist",
+            )
+
+        page_count = self.get_page_count(file_id)
+        if page_id >= page_count:
+            return WriteResult(
+                success=False,
+                status="error",
+                page_id=page_id,
+                file_id=file_id,
+                old_data=b"",
+                new_data=data,
+                error_msg="page_id out of range",
+            )
+
+        old_data = self._read_page_bytes_no_count(file_id, page_id)
+        if len(old_data) != self.page_size:
+            return WriteResult(
+                success=False,
+                status="error",
+                page_id=page_id,
+                file_id=file_id,
+                old_data=old_data,
+                new_data=data,
+                error_msg="short read before write",
+            )
+
+        file_path = self._file_path(file_id)
+        with open(file_path, "r+b") as data_file:
+            data_file.seek(self._page_offset(page_id))
+            data_file.write(data)
+            data_file.flush()
+
+        self.write_count += 1
+        self.log_write(file_id, page_id, old_data, data)
+
+        return WriteResult(
+            success=True,
+            status="success",
+            page_id=page_id,
+            file_id=file_id,
+            old_data=old_data,
+            new_data=data,
+            error_msg="",
+        )
 
     def allocate_page(self, file_id: str) -> AllocResult:
         """
@@ -111,7 +303,54 @@ class DiskSpaceManager:
 
         Returns AllocResult(success=False) on I/O error.
         """
-        raise NotImplementedError
+        try:
+            self.create_file(file_id)
+            free_list = self._read_free_list(file_id)
+
+            if free_list:
+                page_id = free_list.pop(0)
+                self._write_free_list(file_id, free_list)
+                write_result = self.write_page(file_id, page_id, self._zero_page())
+                if not write_result.success:
+                    return AllocResult(
+                        success=False,
+                        status="error",
+                        page_id=page_id,
+                        file_id=file_id,
+                        error_msg=write_result.error_msg,
+                    )
+                return AllocResult(
+                    success=True,
+                    status="success",
+                    page_id=page_id,
+                    file_id=file_id,
+                    error_msg="",
+                )
+
+            file_path = self._file_path(file_id)
+            page_id = self.get_page_count(file_id)
+            with open(file_path, "ab") as data_file:
+                data_file.write(self._zero_page())
+                data_file.flush()
+
+            self.write_count += 1
+            self.log_write(file_id, page_id, b"", self._zero_page())
+
+            return AllocResult(
+                success=True,
+                status="success",
+                page_id=page_id,
+                file_id=file_id,
+                error_msg="",
+            )
+        except OSError as exc:
+            return AllocResult(
+                success=False,
+                status="error",
+                page_id=-1,
+                file_id=file_id,
+                error_msg=str(exc),
+            )
 
     # ─── Stats ────────────────────────────────────────────────────────────────
 
