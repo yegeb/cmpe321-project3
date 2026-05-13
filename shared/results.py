@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Any, List
 
 
@@ -20,6 +20,7 @@ class PageResult:
 class WriteResult:
     """DiskSpaceManager.write_page() return value."""
     success: bool
+    status: str           # "success" | "error"
     page_id: int
     file_id: str
     old_data: bytes       # page content before the write
@@ -31,6 +32,7 @@ class WriteResult:
 class AllocResult:
     """DiskSpaceManager.allocate_page() return value."""
     success: bool
+    status: str           # "success" | "error"
     page_id: int          # newly allocated page number (0-indexed within file)
     file_id: str
     error_msg: str = ""
@@ -121,4 +123,18 @@ class RecordResult:
     pages_accessed: int
     index_nodes_visited: int       # 0 for heap_scan
     status: str                    # "success" | "failure"
+    error_msg: str = ""
+
+
+@dataclass
+class QueryPlanResult:
+    """
+    Returned by FileIndexManager.estimate_command().
+    Used by QueryProcessor to print explain output before execution.
+    """
+    strategy: str                  # "heap_scan" | "hash_index" | "bplus_tree"
+    estimated_io: int
+    estimated_pages_scanned: int = 0
+    estimated_index_nodes: int = 0
+    status: str = "success"        # "success" | "failure"
     error_msg: str = ""

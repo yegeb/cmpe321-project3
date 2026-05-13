@@ -38,7 +38,13 @@ File naming convention
 
 from typing import List, Tuple, Any, Optional
 
-from shared.results import TypeResult, RecordResult, RecordOpResult, TypeInfo
+from shared.results import (
+    TypeResult,
+    RecordResult,
+    RecordOpResult,
+    TypeInfo,
+    QueryPlanResult,
+)
 from buffer_manager import BufferManager
 
 
@@ -168,11 +174,34 @@ class FileIndexManager:
         field_name must be an integer field; return failure otherwise.
 
         Strategy:
-          bplus_tree – use B+ tree range scan (O(log n + k)).
+          bplus_tree – use the B+ tree only if field_name is the primary-key field.
+                       Otherwise fall back to heap_scan, because the project
+                       defines only one B+ tree on the primary key.
           hash_index – fall back to heap_scan (hash doesn't support ranges).
           heap_scan  – sequential scan of all data pages.
 
         Records are returned in ascending order of field_name value.
+        """
+        raise NotImplementedError
+
+    def estimate_command(self, command_tokens: List[str]) -> QueryPlanResult:
+        """
+        Return an execution-plan estimate for QueryProcessor.explain().
+
+        command_tokens is the tokenized inner DML command without the leading
+        "explain". Examples:
+          ["search", "record", "house", "Atreides"]
+          ["range_search", "house", "wealth", "4000", "9000"]
+
+        The estimate is advisory, not exact. It must choose the strategy that
+        the real execution path will use and provide:
+          - estimated_io
+          - estimated_pages_scanned
+          - estimated_index_nodes
+
+        Range-search rule:
+          If config strategy is "bplus_tree" but field_name is not the primary
+          key field, this method must report strategy="heap_scan".
         """
         raise NotImplementedError
 

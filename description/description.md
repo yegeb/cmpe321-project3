@@ -195,7 +195,9 @@ layers:
 - **heap_scan** — Sequential scan, no index. The baseline.
 - **hash_index** — Static hash on primary key. Equality lookups only. Falls back to heap_scan
     for range queries.
-- **bplus_tree** — B+ tree on primary key. Equality and range lookups.
+- **bplus_tree** — B+ tree on primary key. Equality lookups on the primary key and
+  primary-key range lookups. If a `range_search` is requested on a non-primary-key integer
+  field, the system must fall back to `heap_scan`.
 
 Indexes must be built when a type is created and maintained on every insert/delete. Index data
 must be stored in pages that go through the Buffer Manager.
@@ -271,6 +273,10 @@ new_data: bytes # what was written
 All inter-layer communication must flow through Result objects. If your layers pass raw
 values (plain bytes, bare integers) instead of Result objects, the modular design is broken.
 We must be able to swap one layer’s output format without touching other layers.
+
+Practical convention for this project: every Result object should expose an explicit status field
+(`"success"`, `"failure"`, or `"error"` as appropriate) plus any boolean helpers such as
+`success`. This keeps all layers aligned on one checking style.
 ```
 
 ## 6 Configuration File
@@ -577,4 +583,3 @@ file. The report must be in PDF format, named as: Student ID_Contribution.pdf (e
 AI tools are permitted as learning aids. Include ai_usage.md describing what you used, what
 you asked, and what you changed. Honest disclosure is not penalized. You must be able to
 explain every part of your code.
-

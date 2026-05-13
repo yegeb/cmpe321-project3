@@ -151,6 +151,8 @@ class QueryProcessor:
           Buffer Misses: <n>
           Pages Scanned: <n>
 
+        The plan section must be produced from
+        file_idx.estimate_command(tokens), not hard-coded inside QueryProcessor.
         All written to output.txt.
         """
         raise NotImplementedError

@@ -7,12 +7,12 @@ FileIndexManager must NEVER call DiskSpaceManager directly.
 Buffer pool
 ───────────
 A fixed number of frames (config["buffer_pool_size"]) each holding one page.
-Each frame tracks: (file_id, page_id, data, dirty, pinned).
+Each frame tracks: (file_id, page_id, data, dirty, last_access_counter).
 
 Replacement policies (config["replacement_policy"])
 ────────────────────────────────────────────────────
-  "LRU" – evict the least recently used unpinned frame.
-  "MRU" – evict the most recently used unpinned frame.
+  "LRU" – evict the least recently used frame.
+  "MRU" – evict the most recently used frame.
 
 Write flow
 ──────────
@@ -99,6 +99,18 @@ class BufferManager:
 
     def flush_file(self, file_id: str) -> None:
         """Write all dirty frames belonging to file_id to disk."""
+        raise NotImplementedError
+
+    def estimate_data_page_reads(self, file_id: str, page_count: int) -> int:
+        """
+        Return a simple estimate for how many data-page reads a future operation
+        may perform for this file under the current buffer state.
+
+        This is intentionally approximate and is only used by QueryProcessor's
+        explain output. The default contract is:
+          - pages already resident in the buffer may contribute 0 estimated I/O
+          - pages not resident may contribute 1 estimated read each
+        """
         raise NotImplementedError
 
     # ─── Stats ────────────────────────────────────────────────────────────────
