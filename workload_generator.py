@@ -9,11 +9,13 @@ FIELDS = [
     ("name", "str"),
     ("age", "int"),
     ("city", "str"),
+    ("dept", "str"),
+    ("score", "int"),
 ]
 PRIMARY_KEY_ORDER = 1
 CREATE_TYPE_LINE = (
-    f"create type {TYPE_NAME} 4 {PRIMARY_KEY_ORDER} "
-    "id int name str age int city str"
+    f"create type {TYPE_NAME} 6 {PRIMARY_KEY_ORDER} "
+    "id int name str age int city str dept str score int"
 )
 
 
@@ -23,6 +25,8 @@ def make_record_values(record_id: int) -> list[str]:
         f"Name{record_id}",
         str(20 + (record_id % 50)),
         f"City{record_id % 100}",
+        f"Dept{record_id % 20}",
+        str(100 + (record_id % 900)),
     ]
 
 

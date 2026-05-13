@@ -186,13 +186,6 @@ class FileIndexManager:
         ti = TypeInfo(name=type_name, fields=field_infos,
                       primary_key_order=primary_key_order)
 
-        # Persist to catalog
-        ok = save_type_to_catalog(self.buffer, self.page_size, ti)
-        if not ok:
-            return TypeResult(success=False, type_name=type_name,
-                              status="failure",
-                              error_msg="Failed to write catalog entry.")
-
         # Allocate first data page
         data_res = self.buffer.new_page(type_name)
         if data_res.status != "success":
@@ -219,6 +212,13 @@ class FileIndexManager:
                 return TypeResult(success=False, type_name=type_name,
                                   status="failure",
                                   error_msg="Failed to initialize B+ tree index.")
+
+        # Persist to catalog only after data and index initialization succeed.
+        ok = save_type_to_catalog(self.buffer, self.page_size, ti)
+        if not ok:
+            return TypeResult(success=False, type_name=type_name,
+                              status="failure",
+                              error_msg="Failed to write catalog entry.")
 
         # Update in-memory cache
         self._type_cache[type_name] = ti
@@ -307,11 +307,19 @@ class FileIndexManager:
         if self.strategy == "hash_index":
             nv = hash_insert(self.buffer, self._index_file_id(type_name),
                               pk_value, rid, self._pk_type(ti), self.page_size)
+            if nv is None:
+                self._delete_by_rid(type_name, rid, ti)
+                return RecordOpResult(success=False, status="failure",
+                                      error_msg="Failed to update hash index.")
             self._index_nodes_visited += nv
             op_index_nodes += nv
         elif self.strategy == "bplus_tree":
             nv = bplus_insert(self.buffer, self._index_file_id(type_name),
                                pk_value, rid, self._pk_type(ti), self.page_size)
+            if nv is None:
+                self._delete_by_rid(type_name, rid, ti)
+                return RecordOpResult(success=False, status="failure",
+                                      error_msg="Failed to update B+ tree index.")
             self._index_nodes_visited += nv
             op_index_nodes += nv
 
@@ -337,12 +345,24 @@ class FileIndexManager:
             if rid is None:
                 return RecordOpResult(success=False, status="failure",
                                       error_msg="Record not found.")
+            existing_values, _ = self._fetch_by_rid(type_name, rid, ti)
             found, _, _, pa, _ = self._delete_by_rid(type_name, rid, ti)
             self._pages_accessed += pa
             nv2 = 0
             if found:
                 nv2 = hash_delete(self.buffer, self._index_file_id(type_name),
                                    pk_value, self._pk_type(ti), self.page_size)
+                if nv2 is None:
+                    if existing_values is not None:
+                        page_id, slot_no = rid
+                        page_res = self.buffer.get_page(type_name, page_id)
+                        if page_res.status == "success":
+                            self._write_record_to_slot(
+                                type_name, page_id, slot_no, bytearray(page_res.data),
+                                existing_values, ti.fields
+                            )
+                    return RecordOpResult(success=False, status="failure",
+                                          error_msg="Failed to update hash index.")
                 self._index_nodes_visited += nv2
             return RecordOpResult(success=found, status="success" if found else "failure",
                                   pages_accessed=pa, index_nodes_visited=nv + nv2)
@@ -354,12 +374,24 @@ class FileIndexManager:
             if rid is None:
                 return RecordOpResult(success=False, status="failure",
                                       error_msg="Record not found.")
+            existing_values, _ = self._fetch_by_rid(type_name, rid, ti)
             found, _, _, pa, _ = self._delete_by_rid(type_name, rid, ti)
             self._pages_accessed += pa
             nv2 = 0
             if found:
                 nv2 = bplus_delete(self.buffer, self._index_file_id(type_name),
                                     pk_value, self._pk_type(ti), self.page_size)
+                if nv2 is None:
+                    if existing_values is not None:
+                        page_id, slot_no = rid
+                        page_res = self.buffer.get_page(type_name, page_id)
+                        if page_res.status == "success":
+                            self._write_record_to_slot(
+                                type_name, page_id, slot_no, bytearray(page_res.data),
+                                existing_values, ti.fields
+                            )
+                    return RecordOpResult(success=False, status="failure",
+                                          error_msg="Failed to update B+ tree index.")
                 self._index_nodes_visited += nv2
             return RecordOpResult(success=found, status="success" if found else "failure",
                                   pages_accessed=pa, index_nodes_visited=nv + nv2)
@@ -549,14 +581,14 @@ class FileIndexManager:
             return QueryPlanResult(strategy="heap_scan", estimated_io=0,
                                    status="failure", error_msg="Malformed create command.")
 
-        if cmd in ("search", "delete") and len(command_tokens) >= 4:
+        if cmd in ("search", "delete") and len(command_tokens) == 4:
             type_name = command_tokens[2]
             ti = self._type_cache.get(type_name)
             if ti is None:
                 return QueryPlanResult(strategy="heap_scan", estimated_io=0,
                                        status="failure",
                                        error_msg=f"Unknown type '{type_name}'.")
-            page_count = heap_count_pages(self.buffer, type_name)
+            page_count = self.buffer.get_page_count(type_name)
 
             if self.strategy == "heap_scan":
                 est_io = self.buffer.estimate_data_page_reads(type_name, page_count)
@@ -583,7 +615,7 @@ class FileIndexManager:
                                        estimated_index_nodes=height,
                                        estimated_pages_scanned=1)
 
-        if cmd == "range_search" and len(command_tokens) >= 5:
+        if cmd == "range_search" and len(command_tokens) == 5:
             type_name = command_tokens[1]
             field_name = command_tokens[2]
             ti = self._type_cache.get(type_name)
@@ -591,7 +623,7 @@ class FileIndexManager:
                 return QueryPlanResult(strategy="heap_scan", estimated_io=0,
                                        status="failure",
                                        error_msg=f"Unknown type '{type_name}'.")
-            page_count = heap_count_pages(self.buffer, type_name)
+            page_count = self.buffer.get_page_count(type_name)
 
             use_bplus = (self.strategy == "bplus_tree"
                          and field_name == ti.primary_key_field.name)

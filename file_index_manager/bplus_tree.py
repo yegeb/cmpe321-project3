@@ -299,10 +299,10 @@ def bplus_search(buffer, file_id: str, pk_value, pk_type: str,
 
 
 def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
-                 pk_type: str, page_size: int) -> int:
+                 pk_type: str, page_size: int) -> int | None:
     """
     Insert pk_value → rid into the B+ tree.
-    Returns nodes_visited (for stats).
+    Returns nodes_visited on success, or None on I/O/allocation failure.
     """
     ks = key_size_for(pk_type)
     max_leaf = max_leaf_entries(page_size, ks)
@@ -316,7 +316,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
     while True:
         result = buffer.get_page(file_id, page_id)
         if result.status != "success":
-            return nodes_visited
+            return None
         nodes_visited += 1
         data = result.data
         _, _, _, page_type = unpack_header(data)
@@ -335,7 +335,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
     # --- Insert into leaf ---
     result = buffer.get_page(file_id, page_id)
     if result.status != "success":
-        return nodes_visited
+        return None
     leaf_data = bytearray(result.data)
     num_entries, next_leaf = _read_leaf_header(leaf_data)
     insert_pos = _leaf_find_pos(leaf_data, pk_value, pk_type, ks, num_entries)
@@ -346,20 +346,20 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
         num_entries += 1
         leaf_data[:HEADER_SIZE] = pack_header(page_id, num_entries, 0, PAGE_TYPE_BPLUS_LEAF)
         _write_leaf_header(leaf_data, num_entries, next_leaf)
-        return nodes_visited if _safe_write_page(buffer, file_id, page_id, bytes(leaf_data)) else 0
+        return nodes_visited if _safe_write_page(buffer, file_id, page_id, bytes(leaf_data)) else None
 
     # Leaf is full — split
     new_res = buffer.new_page(file_id)
     if new_res.status != "success":
-        return 0
+        return None
     new_pid = new_res.page_id
     left, right, push_key = _leaf_split(
         leaf_data, insert_pos, pk_value, rid, pk_type, ks,
         num_entries, new_pid, page_size, next_leaf)
     if not _safe_write_page(buffer, file_id, page_id, bytes(left)):
-        return 0
+        return None
     if not _safe_write_page(buffer, file_id, new_pid, bytes(right)):
-        return 0
+        return None
 
     # Push push_key up into parent (may cascade)
     new_child_id = new_pid
@@ -369,7 +369,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
         parent_pid, child_idx = path.pop()
         p_res = buffer.get_page(file_id, parent_pid)
         if p_res.status != "success":
-            return 0
+            return None
         p_data = bytearray(p_res.data)
         num_keys, is_root = _read_internal_header(p_data)
         nodes_visited += 1
@@ -381,20 +381,20 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
             num_keys += 1
             p_data[:HEADER_SIZE] = pack_header(parent_pid, num_keys, 0, PAGE_TYPE_BPLUS_INTERNAL)
             _write_internal_header(p_data, num_keys, is_root)
-            return nodes_visited if _safe_write_page(buffer, file_id, parent_pid, bytes(p_data)) else 0
+            return nodes_visited if _safe_write_page(buffer, file_id, parent_pid, bytes(p_data)) else None
 
         # Parent is also full — split internal node
         new_int_res = buffer.new_page(file_id)
         if new_int_res.status != "success":
-            return 0
+            return None
         new_int_pid = new_int_res.page_id
         left_p, right_p, up_key = _internal_split(
             p_data, child_idx, promote_key, new_child_id,
             pk_type, ks, num_keys, new_int_pid, page_size, is_root)
         if not _safe_write_page(buffer, file_id, parent_pid, bytes(left_p)):
-            return 0
+            return None
         if not _safe_write_page(buffer, file_id, new_int_pid, bytes(right_p)):
-            return 0
+            return None
 
         promote_key = up_key
         new_child_id = new_int_pid
@@ -406,7 +406,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
             # Allocate a copy of the left half to a new page, free up page 0 for new root.
             copy_left_res = buffer.new_page(file_id)
             if copy_left_res.status != "success":
-                return 0
+                return None
             copy_left_pid = copy_left_res.page_id
             # Rewrite left half with new page_id
             left_p2 = bytearray(left_p)
@@ -416,7 +416,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
                 0, PAGE_TYPE_BPLUS_INTERNAL)
             _write_internal_header(left_p2, struct.unpack_from('=H', left_p, 4)[0], False)
             if not _safe_write_page(buffer, file_id, copy_left_pid, bytes(left_p2)):
-                return 0
+                return None
 
             # Page 0 becomes new root
             new_root = make_page(0, PAGE_TYPE_BPLUS_INTERNAL, page_size)
@@ -426,7 +426,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
                 pack_key(promote_key, pk_type)
             _set_child(new_root, 1, ks, new_child_id)
             new_root[:HEADER_SIZE] = pack_header(0, 1, 0, PAGE_TYPE_BPLUS_INTERNAL)
-            return nodes_visited if _safe_write_page(buffer, file_id, 0, bytes(new_root)) else 0
+            return nodes_visited if _safe_write_page(buffer, file_id, 0, bytes(new_root)) else None
 
     # Path exhausted — root itself (leaf at page 0) was split and we need a new root
     # This happens when the tree was just a single leaf (root=leaf) and it split.
@@ -435,7 +435,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
     # Allocate a new page for the left leaf content.
     copy_res = buffer.new_page(file_id)
     if copy_res.status != "success":
-        return 0
+        return None
     copy_pid = copy_res.page_id
     copy_data = bytearray(left)
     copy_data[:HEADER_SIZE] = pack_header(copy_pid,
@@ -445,7 +445,7 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
                        struct.unpack_from('=H', left, 4)[0],
                        new_pid)
     if not _safe_write_page(buffer, file_id, copy_pid, bytes(copy_data)):
-        return 0
+        return None
 
     # Update right leaf's next_leaf already points to orig_next (set during split).
     # Update left leaf (which is now at copy_pid) to point to right.
@@ -459,14 +459,14 @@ def bplus_insert(buffer, file_id: str, pk_value, rid: tuple,
         pack_key(promote_key, pk_type)
     _set_child(new_root, 1, ks, new_child_id)
     new_root[:HEADER_SIZE] = pack_header(0, 1, 0, PAGE_TYPE_BPLUS_INTERNAL)
-    return nodes_visited if _safe_write_page(buffer, file_id, 0, bytes(new_root)) else 0
+    return nodes_visited if _safe_write_page(buffer, file_id, 0, bytes(new_root)) else None
 
 
 def bplus_delete(buffer, file_id: str, pk_value, pk_type: str,
-                 page_size: int) -> int:
+                 page_size: int) -> int | None:
     """
     Delete pk_value from the B+ tree (leaf only; no rebalancing).
-    Returns nodes_visited.
+    Returns nodes_visited on success, or None on I/O failure.
     """
     ks = key_size_for(pk_type)
     page_id = 0
@@ -476,7 +476,7 @@ def bplus_delete(buffer, file_id: str, pk_value, pk_type: str,
     while True:
         result = buffer.get_page(file_id, page_id)
         if result.status != "success":
-            return nodes_visited
+            return None
         nodes_visited += 1
         data = result.data
         _, _, _, page_type = unpack_header(data)
@@ -494,7 +494,7 @@ def bplus_delete(buffer, file_id: str, pk_value, pk_type: str,
     # Delete from leaf
     result = buffer.get_page(file_id, page_id)
     if result.status != "success":
-        return 0
+        return None
     leaf_data = bytearray(result.data)
     num_entries, next_leaf = _read_leaf_header(leaf_data)
     pos = _leaf_find_pos(leaf_data, pk_value, pk_type, ks, num_entries)
@@ -509,7 +509,7 @@ def bplus_delete(buffer, file_id: str, pk_value, pk_type: str,
     num_entries -= 1
     leaf_data[:HEADER_SIZE] = pack_header(page_id, num_entries, 0, PAGE_TYPE_BPLUS_LEAF)
     _write_leaf_header(leaf_data, num_entries, next_leaf)
-    return nodes_visited if _safe_write_page(buffer, file_id, page_id, bytes(leaf_data)) else 0
+    return nodes_visited if _safe_write_page(buffer, file_id, page_id, bytes(leaf_data)) else None
 
 
 def bplus_range(buffer, file_id: str, low, high, pk_type: str,

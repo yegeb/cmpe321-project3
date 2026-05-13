@@ -385,6 +385,13 @@ class BufferManager:
         resident_pages = sum(1 for frame_key in self._frames if frame_key[0] == file_id)
         return max(0, page_count - resident_pages)
 
+    def get_page_count(self, file_id: str) -> int:
+        """
+        Return the on-disk page count for file_id without loading pages into
+        the buffer pool.
+        """
+        return self.disk.get_page_count(file_id)
+
     # ─── Stats ────────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
