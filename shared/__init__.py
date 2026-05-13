@@ -8,6 +8,7 @@ from .results import (
     RecordResult,
     RecordOpResult,
     TypeResult,
+    QueryPlanResult,
 )
 from .constants import (
     INT_SIZE, STR_SIZE,
@@ -25,7 +26,7 @@ from .constants import (
 
 __all__ = [
     "PageResult", "WriteResult", "AllocResult", "BufferResult",
-    "FieldInfo", "TypeInfo", "RecordResult", "RecordOpResult", "TypeResult",
+    "FieldInfo", "TypeInfo", "RecordResult", "RecordOpResult", "TypeResult", "QueryPlanResult",
     "INT_SIZE", "STR_SIZE",
     "HEADER_FORMAT", "HEADER_SIZE",
     "PAGE_TYPE_DATA", "PAGE_TYPE_BPLUS_INTERNAL", "PAGE_TYPE_BPLUS_LEAF",
