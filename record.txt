@@ -1,1 +1,114 @@
-This file is intentionally created as part of the required submission structure.
+CMPE321 Project 3 - Reproducibility Record
+
+This file should contain the exact commands and configuration variants used for
+the required experiments in the report/video. Fill in the measured outputs after
+running the completed system.
+
+==================================================
+1. Common Notes
+==================================================
+
+Run format:
+python3 archive.py <config-file> <input-file>
+
+Workload generation format:
+python3 workload_generator.py --mode MODE --records N --queries Q --seed SEED > workload.txt
+
+Suggested fixed seed:
+321
+
+==================================================
+2. Experiment 1 - LRU vs MRU
+==================================================
+
+Goal:
+Compare replacement policies under sequential and random workloads.
+
+Sequential workload generation:
+python3 workload_generator.py --mode sequential --records <N> --queries <Q> --seed 321 > workloads/exp1_sequential.txt
+
+Random workload generation:
+python3 workload_generator.py --mode random --records <N> --queries <Q> --seed 321 > workloads/exp1_random.txt
+
+LRU config:
+- replacement_policy = LRU
+- buffer_pool_size = <fixed size>
+
+MRU config:
+- replacement_policy = MRU
+- buffer_pool_size = <same fixed size>
+
+Run commands:
+python3 archive.py config_lru.json workloads/exp1_sequential.txt
+python3 archive.py config_mru.json workloads/exp1_sequential.txt
+python3 archive.py config_lru.json workloads/exp1_random.txt
+python3 archive.py config_mru.json workloads/exp1_random.txt
+
+Record results here:
+- Sequential / LRU: I/O = ______ , Hit Rate = ______
+- Sequential / MRU: I/O = ______ , Hit Rate = ______
+- Random / LRU: I/O = ______ , Hit Rate = ______
+- Random / MRU: I/O = ______ , Hit Rate = ______
+
+==================================================
+3. Experiment 2 - Index Strategy Comparison
+==================================================
+
+Goal:
+Compare `heap_scan`, `hash_index`, and `bplus_tree` for equality and range queries.
+
+Equality workload generation:
+python3 workload_generator.py --mode random --records <N> --queries <Q> --seed 321 > workloads/exp2_equality.txt
+
+Range workload generation:
+python3 workload_generator.py --mode range --records <N> --queries <Q> --seed 321 > workloads/exp2_range.txt
+
+Run commands:
+python3 archive.py config_heap.json workloads/exp2_equality.txt
+python3 archive.py config_hash.json workloads/exp2_equality.txt
+python3 archive.py config_bplus.json workloads/exp2_equality.txt
+python3 archive.py config_heap.json workloads/exp2_range.txt
+python3 archive.py config_hash.json workloads/exp2_range.txt
+python3 archive.py config_bplus.json workloads/exp2_range.txt
+
+Record results here:
+- Equality / HeapScan: I/O = ______
+- Equality / HashIndex: I/O = ______
+- Equality / B+-Tree: I/O = ______
+- Range / HeapScan: I/O = ______
+- Range / HashIndex: I/O = ______ (fallback expected)
+- Range / B+-Tree: I/O = ______
+
+==================================================
+4. Experiment 3 - Buffer Pool Size Sensitivity
+==================================================
+
+Goal:
+Measure I/O count and hit rate across buffer sizes 4, 8, 16, 32, 64.
+
+Workload generation:
+python3 workload_generator.py --mode random --records <N> --queries <Q> --seed 321 > workloads/exp3_random.txt
+
+Run commands:
+python3 archive.py config_buf4.json workloads/exp3_random.txt
+python3 archive.py config_buf8.json workloads/exp3_random.txt
+python3 archive.py config_buf16.json workloads/exp3_random.txt
+python3 archive.py config_buf32.json workloads/exp3_random.txt
+python3 archive.py config_buf64.json workloads/exp3_random.txt
+
+Record results here:
+- Buffer 4: I/O = ______ , Hit Rate = ______
+- Buffer 8: I/O = ______ , Hit Rate = ______
+- Buffer 16: I/O = ______ , Hit Rate = ______
+- Buffer 32: I/O = ______ , Hit Rate = ______
+- Buffer 64: I/O = ______ , Hit Rate = ______
+
+==================================================
+5. Final Checklist
+==================================================
+
+- Exact config files archived
+- Exact workload files archived
+- Commands used copied here
+- Measured outputs copied here
+- Report tables match the numbers in this file
