@@ -19,7 +19,7 @@ from .page_utils import (
 
 
 def heap_search(buffer, type_name: str, pk_value, pk_field_order: int, fields,
-                page_size: int):
+                max_records_per_page: int, page_size: int):
     """
     Sequential scan for a record matching pk_value on the primary key field.
 
@@ -41,7 +41,7 @@ def heap_search(buffer, type_name: str, pk_value, pk_field_order: int, fields,
         data = result.data
         _, _, slot_bitmap, _ = unpack_header(data)
 
-        for slot in range(10):   # max 10 slots per data page
+        for slot in range(max_records_per_page):
             if not slot_is_set(slot_bitmap, slot):
                 continue
             records_scanned += 1
@@ -56,7 +56,7 @@ def heap_search(buffer, type_name: str, pk_value, pk_field_order: int, fields,
 
 
 def heap_range(buffer, type_name: str, field_name: str, low, high, fields,
-               page_size: int):
+               max_records_per_page: int, page_size: int):
     """
     Sequential scan returning all records where field_name value is in [low, high].
     field_name must be an int field (enforced by caller).
@@ -79,7 +79,7 @@ def heap_range(buffer, type_name: str, field_name: str, low, high, fields,
         data = result.data
         _, _, slot_bitmap, _ = unpack_header(data)
 
-        for slot in range(10):
+        for slot in range(max_records_per_page):
             if not slot_is_set(slot_bitmap, slot):
                 continue
             records_scanned += 1
@@ -136,7 +136,9 @@ def heap_delete(buffer, type_name: str, pk_value, pk_field_order: int, fields,
             slot_bitmap = clear_slot(slot_bitmap, found_slot)
             num_records -= 1
             data[:HEADER_SIZE] = pack_header(page_id, num_records, slot_bitmap, PAGE_TYPE_DATA)
-            buffer.write_page(type_name, page_id, bytes(data))
+            write_res = buffer.write_page(type_name, page_id, bytes(data))
+            if write_res.status != "success":
+                return False, -1, -1, pages_accessed, records_scanned
             return True, page_id, found_slot, pages_accessed, records_scanned
 
         page_id += 1
@@ -165,7 +167,9 @@ def heap_find_free_slot(buffer, type_name: str, max_records_per_page: int,
                 return -1, -1, None, pages_accessed
             new_pid = new_res.page_id
             page = make_page(new_pid, PAGE_TYPE_DATA, page_size)
-            buffer.write_page(type_name, new_pid, bytes(page))
+            write_res = buffer.write_page(type_name, new_pid, bytes(page))
+            if write_res.status != "success":
+                return -1, -1, None, pages_accessed
             return new_pid, 0, bytearray(page), pages_accessed
 
         pages_accessed += 1
@@ -189,7 +193,15 @@ def heap_count_pages(buffer, type_name: str) -> int:
 
 
 def heap_pk_exists(buffer, type_name: str, pk_value, pk_field_order: int,
-                   fields, page_size: int) -> bool:
+                   fields, max_records_per_page: int, page_size: int) -> bool:
     """Quick duplicate-key check via heap scan."""
-    found, _, _ = heap_search(buffer, type_name, pk_value, pk_field_order, fields, page_size)
+    found, _, _ = heap_search(
+        buffer,
+        type_name,
+        pk_value,
+        pk_field_order,
+        fields,
+        max_records_per_page,
+        page_size,
+    )
     return len(found) > 0

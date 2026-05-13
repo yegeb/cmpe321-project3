@@ -106,8 +106,11 @@ class FileIndexManager:
     def _pk_type(self, ti: TypeInfo) -> str:
         return ti.primary_key_field.type
 
+    def _is_valid_identifier(self, value: str, max_len: int) -> bool:
+        return bool(value) and len(value) <= max_len and value.isalnum()
+
     def _write_record_to_slot(self, type_name: str, page_id: int, slot: int,
-                              data: bytearray, values: list, fields) -> None:
+                              data: bytearray, values: list, fields) -> bool:
         """Serialise values into the correct slot in data, update header, write page."""
         rec_size = record_size(fields)
         offset = HEADER_SIZE + slot * rec_size
@@ -117,7 +120,8 @@ class FileIndexManager:
         slot_bitmap = set_slot(slot_bitmap, slot)
         num_records += 1
         data[:HEADER_SIZE] = pack_header(page_id, num_records, slot_bitmap, PAGE_TYPE_DATA)
-        self.buffer.write_page(type_name, page_id, bytes(data))
+        write_res = self.buffer.write_page(type_name, page_id, bytes(data))
+        return write_res.status == "success"
 
     # ─── DDL ─────────────────────────────────────────────────────────────────
 
@@ -148,6 +152,32 @@ class FileIndexManager:
                               status="failure",
                               error_msg=f"Type '{type_name}' already exists.")
 
+        if not fields:
+            return TypeResult(success=False, type_name=type_name,
+                              status="failure",
+                              error_msg="Type must have at least one field.")
+        if len(fields) < 6:
+            return TypeResult(success=False, type_name=type_name,
+                              status="failure",
+                              error_msg="Type must have at least 6 fields.")
+        if not (1 <= primary_key_order <= len(fields)):
+            return TypeResult(success=False, type_name=type_name,
+                              status="failure",
+                              error_msg="Primary key order is out of range.")
+        if not self._is_valid_identifier(type_name, 16):
+            return TypeResult(success=False, type_name=type_name,
+                              status="failure",
+                              error_msg="Type name must be alphanumeric and at most 16 characters.")
+        for field_name, field_type in fields:
+            if not self._is_valid_identifier(field_name, 20):
+                return TypeResult(success=False, type_name=type_name,
+                                  status="failure",
+                                  error_msg="Field names must be alphanumeric and at most 20 characters.")
+            if field_type not in {"int", "str"}:
+                return TypeResult(success=False, type_name=type_name,
+                                  status="failure",
+                                  error_msg=f"Unsupported field type '{field_type}'.")
+
         # Build TypeInfo
         field_infos = [
             FieldInfo(name=fname, type=ftype, order=i + 1)
@@ -170,13 +200,25 @@ class FileIndexManager:
                               status="failure",
                               error_msg="Failed to allocate data page.")
         first_page = make_page(data_res.page_id, PAGE_TYPE_DATA, self.page_size)
-        self.buffer.write_page(type_name, data_res.page_id, bytes(first_page))
+        write_res = self.buffer.write_page(type_name, data_res.page_id, bytes(first_page))
+        if write_res.status != "success":
+            return TypeResult(success=False, type_name=type_name,
+                              status="failure",
+                              error_msg="Failed to initialize first data page.")
 
         # Create index structure
         if self.strategy == "hash_index":
-            hash_init(self.buffer, self._index_file_id(type_name), self.page_size)
+            ok = hash_init(self.buffer, self._index_file_id(type_name), self.page_size)
+            if not ok:
+                return TypeResult(success=False, type_name=type_name,
+                                  status="failure",
+                                  error_msg="Failed to initialize hash index.")
         elif self.strategy == "bplus_tree":
-            bplus_init(self.buffer, self._index_file_id(type_name), self.page_size)
+            ok = bplus_init(self.buffer, self._index_file_id(type_name), self.page_size)
+            if not ok:
+                return TypeResult(success=False, type_name=type_name,
+                                  status="failure",
+                                  error_msg="Failed to initialize B+ tree index.")
 
         # Update in-memory cache
         self._type_cache[type_name] = ti
@@ -207,14 +249,19 @@ class FileIndexManager:
                                   error_msg=f"Type '{type_name}' does not exist.")
 
         ti = self._type_cache[type_name]
+        if len(values) != len(ti.fields):
+            return RecordOpResult(success=False, status="failure",
+                                  error_msg=f"Expected {len(ti.fields)} values, got {len(values)}.")
         pk_idx = ti.primary_key_order - 1
         pk_value = values[pk_idx]
+        op_index_nodes = 0
 
         # Duplicate check
         if self.strategy == "hash_index":
             rid, nv = hash_search(self.buffer, self._index_file_id(type_name),
                                    pk_value, self._pk_type(ti), self.page_size)
             self._index_nodes_visited += nv
+            op_index_nodes += nv
             if rid is not None:
                 return RecordOpResult(success=False, status="failure",
                                       error_msg="Duplicate primary key.")
@@ -222,12 +269,14 @@ class FileIndexManager:
             rid, nv = bplus_search(self.buffer, self._index_file_id(type_name),
                                     pk_value, self._pk_type(ti), self.page_size)
             self._index_nodes_visited += nv
+            op_index_nodes += nv
             if rid is not None:
                 return RecordOpResult(success=False, status="failure",
                                       error_msg="Duplicate primary key.")
         else:
             found, pa, _ = heap_search(self.buffer, type_name, pk_value,
-                                        ti.primary_key_order, ti.fields, self.page_size)
+                                        ti.primary_key_order, ti.fields,
+                                        self.max_records_per_page, self.page_size)
             self._pages_accessed += pa
             if found:
                 return RecordOpResult(success=False, status="failure",
@@ -243,7 +292,14 @@ class FileIndexManager:
                                   error_msg="Failed to allocate slot.")
 
         # Write record
-        self._write_record_to_slot(type_name, page_id, slot, data, values, ti.fields)
+        try:
+            write_ok = self._write_record_to_slot(type_name, page_id, slot, data, values, ti.fields)
+        except (ValueError, TypeError) as exc:
+            return RecordOpResult(success=False, status="failure",
+                                  error_msg=str(exc))
+        if not write_ok:
+            return RecordOpResult(success=False, status="failure",
+                                  error_msg="Failed to write record to data page.")
         self._pages_accessed += 1
 
         # Update index
@@ -252,14 +308,16 @@ class FileIndexManager:
             nv = hash_insert(self.buffer, self._index_file_id(type_name),
                               pk_value, rid, self._pk_type(ti), self.page_size)
             self._index_nodes_visited += nv
+            op_index_nodes += nv
         elif self.strategy == "bplus_tree":
             nv = bplus_insert(self.buffer, self._index_file_id(type_name),
                                pk_value, rid, self._pk_type(ti), self.page_size)
             self._index_nodes_visited += nv
+            op_index_nodes += nv
 
         return RecordOpResult(success=True, status="success",
                               pages_accessed=pa + 1,
-                              index_nodes_visited=self._index_nodes_visited)
+                              index_nodes_visited=op_index_nodes)
 
     def delete_record(self, type_name: str, pk_value: Any) -> RecordOpResult:
         """
@@ -333,7 +391,9 @@ class FileIndexManager:
         slot_bitmap = clear_slot(slot_bitmap, slot_no)
         num_records -= 1
         data[:HEADER_SIZE] = pack_header(page_id, num_records, slot_bitmap, PAGE_TYPE_DATA)
-        self.buffer.write_page(type_name, page_id, bytes(data))
+        write_res = self.buffer.write_page(type_name, page_id, bytes(data))
+        if write_res.status != "success":
+            return False, -1, -1, 1, 0
         return True, page_id, slot_no, 1, 0
 
     def search_record(self, type_name: str, pk_value: Any) -> RecordResult:
@@ -381,7 +441,8 @@ class FileIndexManager:
 
         else:   # heap_scan
             found, pa, rs = heap_search(self.buffer, type_name, pk_value,
-                                         ti.primary_key_order, ti.fields, self.page_size)
+                                         ti.primary_key_order, ti.fields,
+                                         self.max_records_per_page, self.page_size)
             self._pages_accessed += pa
             self._records_scanned += rs
             self._records_returned += len(found)
@@ -396,6 +457,9 @@ class FileIndexManager:
         if result.status != "success":
             return None, 1
         data = result.data
+        _, _, slot_bitmap, _ = unpack_header(data)
+        if not slot_is_set(slot_bitmap, slot_no):
+            return None, 1
         rec_size = record_size(ti.fields)
         offset = HEADER_SIZE + slot_no * rec_size
         values = unpack_record(data, ti.fields, offset)
@@ -451,7 +515,8 @@ class FileIndexManager:
 
         # Fall back to heap scan (hash_index, or bplus on non-pk field, or heap_scan)
         matched, pa, rs = heap_range(self.buffer, type_name, field_name,
-                                      low, high, ti.fields, self.page_size)
+                                      low, high, ti.fields,
+                                      self.max_records_per_page, self.page_size)
         self._pages_accessed += pa
         self._records_scanned += rs
         self._records_returned += len(matched)
@@ -475,8 +540,14 @@ class FileIndexManager:
         cmd = command_tokens[0].lower()
 
         if cmd == "create":
-            return QueryPlanResult(strategy="heap_scan", estimated_io=1,
-                                   estimated_pages_scanned=1)
+            if len(command_tokens) >= 2 and command_tokens[1].lower() == "type":
+                return QueryPlanResult(strategy="heap_scan", estimated_io=1,
+                                       estimated_pages_scanned=1)
+            if len(command_tokens) >= 2 and command_tokens[1].lower() == "record":
+                return QueryPlanResult(strategy=self.strategy, estimated_io=1,
+                                       estimated_pages_scanned=1)
+            return QueryPlanResult(strategy="heap_scan", estimated_io=0,
+                                   status="failure", error_msg="Malformed create command.")
 
         if cmd in ("search", "delete") and len(command_tokens) >= 4:
             type_name = command_tokens[2]

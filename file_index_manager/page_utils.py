@@ -14,6 +14,18 @@ from shared.constants import (
 )
 
 
+def _validate_field_type(field_type: str) -> None:
+    if field_type not in {"int", "str"}:
+        raise ValueError(f"Unsupported field type: {field_type}")
+
+
+def _pack_fixed_string(value, width: int) -> bytes:
+    raw = str(value).encode("ascii")
+    if len(raw) > width:
+        raise ValueError(f"String value exceeds fixed width {width}: {value}")
+    return struct.pack(f"={width}s", raw)
+
+
 # ─── Page header ─────────────────────────────────────────────────────────────
 
 def pack_header(page_no: int, num_records: int, slot_bitmap: int, page_type: int) -> bytes:
@@ -58,19 +70,28 @@ def find_free_slot(bitmap: int, max_slots: int) -> int:
 
 def record_size(fields) -> int:
     """Return fixed byte size of one record given its FieldInfo list."""
-    return sum(INT_SIZE if f.type == "int" else STR_SIZE for f in fields)
+    total = 0
+    for field in fields:
+        _validate_field_type(field.type)
+        total += INT_SIZE if field.type == "int" else STR_SIZE
+    return total
 
 
 def pack_record(values, fields) -> bytes:
     """Serialize a list of Python values to raw record bytes."""
+    if len(values) != len(fields):
+        raise ValueError(
+            f"Record value count mismatch: expected {len(fields)}, got {len(values)}"
+        )
+
     parts = []
     for val, field in zip(values, fields):
+        _validate_field_type(field.type)
         if field.type == "int":
-            parts.append(struct.pack('=i', int(val)))
+            parts.append(struct.pack("=i", int(val)))
         else:
-            raw = str(val).encode('ascii')
-            parts.append(struct.pack(f'={STR_SIZE}s', raw))
-    return b''.join(parts)
+            parts.append(_pack_fixed_string(val, STR_SIZE))
+    return b"".join(parts)
 
 
 def unpack_record(data, fields, offset: int = 0) -> list:
@@ -78,12 +99,13 @@ def unpack_record(data, fields, offset: int = 0) -> list:
     values = []
     pos = offset
     for field in fields:
+        _validate_field_type(field.type)
         if field.type == "int":
-            val = struct.unpack_from('=i', data, pos)[0]
+            val = struct.unpack_from("=i", data, pos)[0]
             pos += INT_SIZE
         else:
-            raw = struct.unpack_from(f'={STR_SIZE}s', data, pos)[0]
-            val = raw.rstrip(b'\x00').decode('ascii')
+            raw = struct.unpack_from(f"={STR_SIZE}s", data, pos)[0]
+            val = raw.rstrip(b"\x00").decode("ascii")
             pos += STR_SIZE
         values.append(val)
     return values
@@ -92,25 +114,28 @@ def unpack_record(data, fields, offset: int = 0) -> list:
 # ─── B+ tree key helpers ──────────────────────────────────────────────────────
 
 def key_size_for(pk_type: str) -> int:
+    _validate_field_type(pk_type)
     return INT_SIZE if pk_type == "int" else STR_SIZE
 
 
 def pack_key(key, pk_type: str) -> bytes:
+    _validate_field_type(pk_type)
     if pk_type == "int":
-        return struct.pack('=i', int(key))
-    raw = str(key).encode('ascii')
-    return struct.pack(f'={STR_SIZE}s', raw)
+        return struct.pack("=i", int(key))
+    return _pack_fixed_string(key, STR_SIZE)
 
 
 def unpack_key(data, pk_type: str, offset: int = 0):
+    _validate_field_type(pk_type)
     if pk_type == "int":
-        return struct.unpack_from('=i', data, offset)[0]
-    raw = struct.unpack_from(f'={STR_SIZE}s', data, offset)[0]
-    return raw.rstrip(b'\x00').decode('ascii')
+        return struct.unpack_from("=i", data, offset)[0]
+    raw = struct.unpack_from(f"={STR_SIZE}s", data, offset)[0]
+    return raw.rstrip(b"\x00").decode("ascii")
 
 
 def compare_keys(a, b, pk_type: str) -> int:
     """Return negative/0/positive like cmp(a, b)."""
+    _validate_field_type(pk_type)
     if a < b:
         return -1
     if a > b:
@@ -132,7 +157,7 @@ def unpack_rid(data, offset: int = 0):
 # ─── B+ tree layout offsets ───────────────────────────────────────────────────
 #
 # Internal node content starts at HEADER_SIZE + BPLUS_INTERNAL_EXTRA_HEADER_SIZE = 20
-# Layout: [child0][key0][child1][key1]...[childN]
+# Layout used by this codebase: [child0][key0][child1][key1]...[childN]
 #   child[i] at: INTERNAL_DATA + i * (4 + key_size)
 #   key[i]   at: INTERNAL_DATA + i * (4 + key_size) + 4
 #

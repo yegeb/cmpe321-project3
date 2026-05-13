@@ -19,6 +19,7 @@ Key is always the primary key field of the relation.
 Equality lookup only; range queries fall back to heap scan.
 """
 
+import hashlib
 import struct
 from shared.constants import (
     HEADER_SIZE,
@@ -41,7 +42,9 @@ _DIR_ENTRIES_OFFSET    = HEADER_SIZE + struct.calcsize(HASH_DIR_EXTRA_HEADER_FOR
 
 def _hash_key(key, num_buckets: int) -> int:
     """Map a primary key value to a bucket index."""
-    return hash(key) % num_buckets
+    raw = str(key).encode("ascii")
+    digest = hashlib.sha256(raw).digest()
+    return int.from_bytes(digest[:8], "little") % num_buckets
 
 
 def _max_bucket_entries(page_size: int, ks: int) -> int:
@@ -50,39 +53,47 @@ def _max_bucket_entries(page_size: int, ks: int) -> int:
 
 # ─── Initialization ───────────────────────────────────────────────────────────
 
-def hash_init(buffer, file_id: str, page_size: int) -> None:
+def hash_init(buffer, file_id: str, page_size: int) -> bool:
     """
     Create the directory page + NUM_HASH_BUCKETS bucket pages.
     Called once when a new type is created with hash_index strategy.
     """
     # Allocate directory page (will be page 0)
     dir_res = buffer.new_page(file_id)
-    assert dir_res.page_id == 0, "Directory page must be page 0"
+    if dir_res.status != "success" or dir_res.page_id != 0:
+        return False
 
     # Allocate bucket pages 1..NUM_HASH_BUCKETS
     bucket_page_ids = []
     for _ in range(NUM_HASH_BUCKETS):
         bkt_res = buffer.new_page(file_id)
+        if bkt_res.status != "success":
+            return False
         bucket_page_ids.append(bkt_res.page_id)
         bkt_page = make_page(bkt_res.page_id, PAGE_TYPE_HASH_BUCKET, page_size)
         # Write bucket header: num_entries=0, next_bucket=NULL_PAGE_ID
         struct.pack_into(HASH_BUCKET_EXTRA_HEADER_FORMAT, bkt_page, HEADER_SIZE,
                          0, NULL_PAGE_ID)
-        buffer.write_page(file_id, bkt_res.page_id, bytes(bkt_page))
+        write_res = buffer.write_page(file_id, bkt_res.page_id, bytes(bkt_page))
+        if write_res.status != "success":
+            return False
 
     # Build directory page
     dir_page = make_page(0, PAGE_TYPE_HASH_DIR, page_size)
     struct.pack_into(HASH_DIR_EXTRA_HEADER_FORMAT, dir_page, HEADER_SIZE, NUM_HASH_BUCKETS)
     for i, bpid in enumerate(bucket_page_ids):
         struct.pack_into('=I', dir_page, _DIR_ENTRIES_OFFSET + i * 4, bpid)
-    buffer.write_page(file_id, 0, bytes(dir_page))
+    write_res = buffer.write_page(file_id, 0, bytes(dir_page))
+    return write_res.status == "success"
 
 
 # ─── Directory helpers ────────────────────────────────────────────────────────
 
-def _get_bucket_page_id(buffer, file_id: str, bucket_idx: int) -> int:
+def _get_bucket_page_id(buffer, file_id: str, bucket_idx: int):
     """Read the directory to find which page_id holds bucket_idx."""
     dir_res = buffer.get_page(file_id, 0)
+    if dir_res.status != "success":
+        return None
     data = dir_res.data
     return struct.unpack_from('=I', data, _DIR_ENTRIES_OFFSET + bucket_idx * 4)[0]
 
@@ -101,7 +112,9 @@ def hash_search(buffer, file_id: str, pk_value, pk_type: str,
     ks = key_size_for(pk_type)
     bucket_idx = _hash_key(pk_value, NUM_HASH_BUCKETS)
     page_id = _get_bucket_page_id(buffer, file_id, bucket_idx)
-    nodes_visited = 1   # directory read counted separately; start bucket chain
+    if page_id is None:
+        return None, 0
+    nodes_visited = 0
 
     while page_id != NULL_PAGE_ID:
         result = buffer.get_page(file_id, page_id)
@@ -137,7 +150,9 @@ def hash_insert(buffer, file_id: str, pk_value, rid: tuple,
     max_entries = _max_bucket_entries(page_size, ks)
     bucket_idx = _hash_key(pk_value, NUM_HASH_BUCKETS)
     page_id = _get_bucket_page_id(buffer, file_id, bucket_idx)
-    nodes_visited = 1
+    if page_id is None:
+        return 0
+    nodes_visited = 0
 
     # Walk the overflow chain to find a page with space (or the last page)
     prev_page_id = NULL_PAGE_ID
@@ -158,14 +173,16 @@ def hash_insert(buffer, file_id: str, pk_value, rid: tuple,
             num_entries += 1
             struct.pack_into(HASH_BUCKET_EXTRA_HEADER_FORMAT, data, HEADER_SIZE,
                              num_entries, next_bucket)
-            buffer.write_page(file_id, page_id, bytes(data))
-            return nodes_visited
+            write_res = buffer.write_page(file_id, page_id, bytes(data))
+            return nodes_visited if write_res.status == "success" else 0
 
         prev_page_id = page_id
         page_id = next_bucket
 
     # All pages in chain are full — allocate overflow page
     ovf_res = buffer.new_page(file_id)
+    if ovf_res.status != "success":
+        return 0
     ovf_pid = ovf_res.page_id
     ovf_page = make_page(ovf_pid, PAGE_TYPE_HASH_BUCKET, page_size)
     # Write the new entry
@@ -174,15 +191,21 @@ def hash_insert(buffer, file_id: str, pk_value, rid: tuple,
     ovf_page[off + ks: off + ks + RID_SIZE] = pack_rid(*rid)
     struct.pack_into(HASH_BUCKET_EXTRA_HEADER_FORMAT, ovf_page, HEADER_SIZE,
                      1, NULL_PAGE_ID)
-    buffer.write_page(file_id, ovf_pid, bytes(ovf_page))
+    write_res = buffer.write_page(file_id, ovf_pid, bytes(ovf_page))
+    if write_res.status != "success":
+        return 0
 
     # Link previous tail to new overflow page
     if prev_page_id != NULL_PAGE_ID:
         prev_res = buffer.get_page(file_id, prev_page_id)
+        if prev_res.status != "success":
+            return 0
         prev_data = bytearray(prev_res.data)
         ne, _ = struct.unpack_from(HASH_BUCKET_EXTRA_HEADER_FORMAT, prev_data, HEADER_SIZE)
         struct.pack_into(HASH_BUCKET_EXTRA_HEADER_FORMAT, prev_data, HEADER_SIZE, ne, ovf_pid)
-        buffer.write_page(file_id, prev_page_id, bytes(prev_data))
+        prev_write_res = buffer.write_page(file_id, prev_page_id, bytes(prev_data))
+        if prev_write_res.status != "success":
+            return 0
 
     return nodes_visited + 1
 
@@ -199,7 +222,9 @@ def hash_delete(buffer, file_id: str, pk_value, pk_type: str,
     ks = key_size_for(pk_type)
     bucket_idx = _hash_key(pk_value, NUM_HASH_BUCKETS)
     page_id = _get_bucket_page_id(buffer, file_id, bucket_idx)
-    nodes_visited = 1
+    if page_id is None:
+        return 0
+    nodes_visited = 0
 
     while page_id != NULL_PAGE_ID:
         result = buffer.get_page(file_id, page_id)
@@ -223,8 +248,8 @@ def hash_delete(buffer, file_id: str, pk_value, pk_type: str,
                 num_entries -= 1
                 struct.pack_into(HASH_BUCKET_EXTRA_HEADER_FORMAT, data, HEADER_SIZE,
                                  num_entries, next_bucket)
-                buffer.write_page(file_id, page_id, bytes(data))
-                return nodes_visited
+                write_res = buffer.write_page(file_id, page_id, bytes(data))
+                return nodes_visited if write_res.status == "success" else 0
 
         page_id = next_bucket
 

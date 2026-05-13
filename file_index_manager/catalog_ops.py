@@ -42,6 +42,13 @@ _FIELD_SIZE = struct.calcsize(_FIELD_FMT)                  # == 25
 assert _ENTRY_HEADER_SIZE + CATALOG_MAX_FIELDS * _FIELD_SIZE == CATALOG_ENTRY_SIZE
 
 
+def _pack_fixed_ascii(value: str, width: int, label: str) -> bytes:
+    raw = value.encode("ascii")
+    if len(raw) > width:
+        raise ValueError(f"{label} exceeds fixed width {width}: {value}")
+    return raw
+
+
 def _entries_per_page(page_size: int) -> int:
     return (page_size - HEADER_SIZE) // CATALOG_ENTRY_SIZE
 
@@ -54,9 +61,14 @@ def _entry_offset(slot: int) -> int:
 
 def pack_type_entry(ti: TypeInfo) -> bytes:
     """Serialize TypeInfo → exactly CATALOG_ENTRY_SIZE bytes."""
+    if len(ti.fields) > CATALOG_MAX_FIELDS:
+        raise ValueError(
+            f"Type '{ti.name}' has {len(ti.fields)} fields; max is {CATALOG_MAX_FIELDS}"
+        )
+
     header = struct.pack(
         _ENTRY_HEADER_FMT,
-        ti.name.encode('ascii'),
+        _pack_fixed_ascii(ti.name, CATALOG_TYPE_NAME_SIZE, "type name"),
         len(ti.fields),
         ti.primary_key_order,
     )
@@ -65,7 +77,11 @@ def pack_type_entry(ti: TypeInfo) -> bytes:
         if i < len(ti.fields):
             f = ti.fields[i]
             ftype = CATALOG_FIELD_TYPE_INT if f.type == "int" else CATALOG_FIELD_TYPE_STR
-            fields_bytes += struct.pack(_FIELD_FMT, f.name.encode('ascii'), ftype)
+            fields_bytes += struct.pack(
+                _FIELD_FMT,
+                _pack_fixed_ascii(f.name, CATALOG_FIELD_NAME_SIZE, "field name"),
+                ftype,
+            )
         else:
             fields_bytes += b'\x00' * _FIELD_SIZE
     entry = header + bytes(fields_bytes)
@@ -87,7 +103,12 @@ def unpack_type_entry(data, offset: int = 0) -> Optional[TypeInfo]:
         field_bytes = data[field_off: field_off + _FIELD_SIZE]
         fname_raw, ftype = struct.unpack(_FIELD_FMT, field_bytes)
         fname = fname_raw.rstrip(b'\x00').decode('ascii')
-        ftype_str = "int" if ftype == CATALOG_FIELD_TYPE_INT else "str"
+        if ftype == CATALOG_FIELD_TYPE_INT:
+            ftype_str = "int"
+        elif ftype == CATALOG_FIELD_TYPE_STR:
+            ftype_str = "str"
+        else:
+            raise ValueError(f"Invalid catalog field type byte: {ftype}")
         fields.append(FieldInfo(name=fname, type=ftype_str, order=i + 1))
         field_off += _FIELD_SIZE
 
@@ -109,10 +130,15 @@ def load_catalog(buffer, page_size: int) -> dict:
         if result.status != "success":
             break
         data = result.data
-        _, _, slot_bitmap, _ = unpack_header(data)
+        _, _, slot_bitmap, page_type = unpack_header(data)
+        if page_type != PAGE_TYPE_CATALOG:
+            break
         for slot in range(n_per_page):
             if slot_is_set(slot_bitmap, slot):
-                ti = unpack_type_entry(data, _entry_offset(slot))
+                try:
+                    ti = unpack_type_entry(data, _entry_offset(slot))
+                except (ValueError, UnicodeDecodeError):
+                    continue
                 if ti:
                     cache[ti.name] = ti
         page_id += 1
@@ -138,15 +164,20 @@ def save_type_to_catalog(buffer, page_size: int, ti: TypeInfo) -> bool:
                 return False
             new_pid = new_res.page_id
             page = make_page(new_pid, PAGE_TYPE_CATALOG, page_size)
-            buffer.write_page(CATALOG_FILE_ID, new_pid, bytes(page))
+            write_res = buffer.write_page(CATALOG_FILE_ID, new_pid, bytes(page))
+            if write_res.status != "success":
+                return False
             # Write entry into slot 0 of this brand-new page.
             page_data = bytearray(page)
             off = _entry_offset(0)
-            page_data[off: off + CATALOG_ENTRY_SIZE] = pack_type_entry(ti)
+            try:
+                page_data[off: off + CATALOG_ENTRY_SIZE] = pack_type_entry(ti)
+            except ValueError:
+                return False
             bitmap = set_slot(0, 0)
             page_data[:HEADER_SIZE] = pack_header(new_pid, 1, bitmap, PAGE_TYPE_CATALOG)
-            buffer.write_page(CATALOG_FILE_ID, new_pid, bytes(page_data))
-            return True
+            write_res = buffer.write_page(CATALOG_FILE_ID, new_pid, bytes(page_data))
+            return write_res.status == "success"
 
         data = bytearray(result.data)
         _, num_records, slot_bitmap, _ = unpack_header(data)
@@ -157,9 +188,12 @@ def save_type_to_catalog(buffer, page_size: int, ti: TypeInfo) -> bool:
             continue
 
         off = _entry_offset(slot)
-        data[off: off + CATALOG_ENTRY_SIZE] = pack_type_entry(ti)
+        try:
+            data[off: off + CATALOG_ENTRY_SIZE] = pack_type_entry(ti)
+        except ValueError:
+            return False
         slot_bitmap = set_slot(slot_bitmap, slot)
         num_records += 1
         data[:HEADER_SIZE] = pack_header(page_id, num_records, slot_bitmap, PAGE_TYPE_CATALOG)
-        buffer.write_page(CATALOG_FILE_ID, page_id, bytes(data))
-        return True
+        write_res = buffer.write_page(CATALOG_FILE_ID, page_id, bytes(data))
+        return write_res.status == "success"
