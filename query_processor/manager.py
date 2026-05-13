@@ -69,6 +69,12 @@ class QueryProcessor:
         self._stats_path: str = os.path.join(self._base_dir, "stats_output.txt")
         self._log_path: str = os.path.join(self._base_dir, "log.csv")
 
+        # State used across process() / handlers
+        self._current_line: str = ""
+        self._explain_mode: bool = False
+        self._explain_buffer: list = []
+        self._suppress_log: bool = False
+
     # ─── Entry point ─────────────────────────────────────────────────────────
 
     def process(self, line: str) -> None:
@@ -86,7 +92,69 @@ class QueryProcessor:
           "stats"            → _cmd_stats
           unknown            → log as failure, do nothing
         """
-        raise NotImplementedError
+        self._current_line = line
+        tokens = line.split()
+        if not tokens:
+            return
+
+        cmd = tokens[0].lower()
+
+        if cmd == "explain":
+            self._cmd_explain(tokens[1:])
+            return
+
+        if cmd == "stats":
+            if len(tokens) >= 2 and tokens[1].lower() == "reset":
+                self._cmd_stats_reset()
+                self._log(line, "success")
+            else:
+                self._cmd_stats()
+                self._log(line, "success")
+            return
+
+        if cmd == "create" and len(tokens) >= 2:
+            sub = tokens[1].lower()
+            if sub == "type":
+                self._cmd_create_type(tokens[2:])
+            elif sub == "record":
+                self._cmd_create_record(tokens[2:])
+            else:
+                self._log(line, "failure")
+            return
+
+        if cmd == "delete" and len(tokens) >= 2 and tokens[1].lower() == "record":
+            self._cmd_delete_record(tokens[2:])
+            return
+
+        if cmd == "search" and len(tokens) >= 2 and tokens[1].lower() == "record":
+            self._cmd_search_record(tokens[2:])
+            return
+
+        if cmd == "range_search":
+            self._cmd_range_search(tokens[1:])
+            return
+
+        self._log(line, "failure")
+
+    # ─── Internal dispatch (reused by _cmd_explain) ───────────────────────────
+
+    def _dispatch(self, tokens: list) -> None:
+        """Route inner command tokens. Used by _cmd_explain to re-run the inner command."""
+        if not tokens:
+            return
+        cmd = tokens[0].lower()
+        if cmd == "create" and len(tokens) >= 2:
+            sub = tokens[1].lower()
+            if sub == "type":
+                self._cmd_create_type(tokens[2:])
+            elif sub == "record":
+                self._cmd_create_record(tokens[2:])
+        elif cmd == "delete" and len(tokens) >= 2 and tokens[1].lower() == "record":
+            self._cmd_delete_record(tokens[2:])
+        elif cmd == "search" and len(tokens) >= 2 and tokens[1].lower() == "record":
+            self._cmd_search_record(tokens[2:])
+        elif cmd == "range_search":
+            self._cmd_range_search(tokens[1:])
 
     # ─── Command handlers ─────────────────────────────────────────────────────
 
@@ -97,7 +165,33 @@ class QueryProcessor:
 
         Calls file_idx.create_type(); logs success or failure.
         """
-        raise NotImplementedError
+        if len(tokens) < 3:
+            self._log(self._current_line, "failure")
+            return
+
+        type_name = tokens[0]
+        try:
+            num_fields = int(tokens[1])
+            pk_order = int(tokens[2])
+        except ValueError:
+            self._log(self._current_line, "failure")
+            return
+
+        if len(tokens) != 3 + 2 * num_fields:
+            self._log(self._current_line, "failure")
+            return
+
+        fields = []
+        for i in range(num_fields):
+            fname = tokens[3 + 2 * i]
+            ftype = tokens[4 + 2 * i]
+            if ftype not in ("int", "str"):
+                self._log(self._current_line, "failure")
+                return
+            fields.append((fname, ftype))
+
+        result = self.file_idx.create_type(type_name, fields, pk_order)
+        self._log(self._current_line, "success" if result.success else "failure")
 
     def _cmd_create_record(self, tokens: list) -> None:
         """
@@ -107,14 +201,56 @@ class QueryProcessor:
         Casts each value to the declared field type before calling
         file_idx.create_record(). Logs success or failure.
         """
-        raise NotImplementedError
+        if not tokens:
+            self._log(self._current_line, "failure")
+            return
+
+        type_name = tokens[0]
+        ti = self.file_idx.get_type_info(type_name)
+        if ti is None:
+            self._log(self._current_line, "failure")
+            return
+
+        raw_values = tokens[1:]
+        if len(raw_values) != len(ti.fields):
+            self._log(self._current_line, "failure")
+            return
+
+        values = []
+        for field, raw in zip(ti.fields, raw_values):
+            try:
+                values.append(int(raw) if field.type == "int" else raw)
+            except ValueError:
+                self._log(self._current_line, "failure")
+                return
+
+        result = self.file_idx.create_record(type_name, values)
+        self._log(self._current_line, "success" if result.success else "failure")
 
     def _cmd_delete_record(self, tokens: list) -> None:
         """
         Tokens: [type_name, pk_value]
         Casts pk_value to primary key type. Logs success or failure.
         """
-        raise NotImplementedError
+        if len(tokens) < 2:
+            self._log(self._current_line, "failure")
+            return
+
+        type_name = tokens[0]
+        ti = self.file_idx.get_type_info(type_name)
+        if ti is None:
+            self._log(self._current_line, "failure")
+            return
+
+        pk_field = ti.primary_key_field
+        try:
+            pk_value = int(tokens[1]) if pk_field.type == "int" else tokens[1]
+        except ValueError:
+            self._log(self._current_line, "failure")
+            return
+
+        result = self.file_idx.delete_record(type_name, pk_value)
+        self._log(self._current_line, "success" if result.success else "failure")
 
     def _cmd_search_record(self, tokens: list) -> None:
         """
@@ -123,7 +259,30 @@ class QueryProcessor:
         On success: write one line "<v1> <v2> ..." to output.txt.
         On failure (not found / type missing): log failure, write nothing.
         """
-        raise NotImplementedError
+        if len(tokens) < 2:
+            self._log(self._current_line, "failure")
+            return
+
+        type_name = tokens[0]
+        ti = self.file_idx.get_type_info(type_name)
+        if ti is None:
+            self._log(self._current_line, "failure")
+            return
+
+        pk_field = ti.primary_key_field
+        try:
+            pk_value = int(tokens[1]) if pk_field.type == "int" else tokens[1]
+        except ValueError:
+            self._log(self._current_line, "failure")
+            return
+
+        result = self.file_idx.search_record(type_name, pk_value)
+        if result.records:
+            for record in result.records:
+                self._write_output(self._format_record(record))
+            self._log(self._current_line, "success")
+        else:
+            self._log(self._current_line, "failure")
 
     def _cmd_range_search(self, tokens: list) -> None:
         """
@@ -132,7 +291,35 @@ class QueryProcessor:
         On success: write one line per matching record to output.txt.
         Failure conditions: type missing, field not int, field not found.
         """
-        raise NotImplementedError
+        if len(tokens) < 4:
+            self._log(self._current_line, "failure")
+            return
+
+        type_name = tokens[0]
+        field_name = tokens[1]
+
+        try:
+            low = int(tokens[2])
+            high = int(tokens[3])
+        except ValueError:
+            self._log(self._current_line, "failure")
+            return
+
+        ti = self.file_idx.get_type_info(type_name)
+        if ti is None:
+            self._log(self._current_line, "failure")
+            return
+
+        field = ti.field_by_name(field_name)
+        if field is None or field.type != "int":
+            self._log(self._current_line, "failure")
+            return
+
+        result = self.file_idx.range_search(type_name, field_name, low, high)
+        for record in result.records:
+            self._write_output(self._format_record(record))
+        # Type exists and field is valid int → always success regardless of record count
+        self._log(self._current_line, "success")
 
     def _cmd_explain(self, tokens: list) -> None:
         """
@@ -155,7 +342,57 @@ class QueryProcessor:
         file_idx.estimate_command(tokens), not hard-coded inside QueryProcessor.
         All written to output.txt.
         """
-        raise NotImplementedError
+        inner_line = " ".join(tokens)
+
+        # Get execution plan estimate before running the command
+        plan = self.file_idx.estimate_command(tokens)
+
+        # Snapshot stats before execution
+        disk_before = self.disk.get_stats()
+        buf_before = self.buffer.get_stats()
+        fim_before = self.file_idx.get_stats()
+
+        # Execute inner command: capture its output and suppress its log entry
+        saved_line = self._current_line
+        self._current_line = inner_line
+        self._explain_mode = True
+        self._explain_buffer = []
+        self._suppress_log = True
+
+        self._dispatch(tokens)
+
+        self._suppress_log = False
+        self._explain_mode = False
+        captured = list(self._explain_buffer)
+        self._explain_buffer = []
+        self._current_line = saved_line
+
+        # Compute delta stats
+        disk_after = self.disk.get_stats()
+        buf_after = self.buffer.get_stats()
+        fim_after = self.file_idx.get_stats()
+
+        reads_delta = disk_after["reads"] - disk_before["reads"]
+        writes_delta = disk_after["writes"] - disk_before["writes"]
+        hits_delta = buf_after["hits"] - buf_before["hits"]
+        misses_delta = buf_after["misses"] - buf_before["misses"]
+        pages_delta = fim_after["pages_accessed"] - fim_before["pages_accessed"]
+
+        # Write formatted explain block to output.txt
+        self._write_output("--- PLAN ---")
+        self._write_output(f"Query: {inner_line}")
+        self._write_output(f"Strategy: {plan.strategy}")
+        self._write_output(f"Estimated I/O: {plan.estimated_io}")
+        self._write_output("--- RESULT ---")
+        for result_line in captured:
+            self._write_output(result_line)
+        self._write_output("--- STATS ---")
+        self._write_output(f"Actual I/O: {reads_delta} reads, {writes_delta} writes")
+        self._write_output(f"Buffer Hits: {hits_delta}")
+        self._write_output(f"Buffer Misses: {misses_delta}")
+        self._write_output(f"Pages Scanned: {pages_delta}")
+
+        self._log(self._current_line, "success")
 
     def _cmd_stats(self) -> None:
         """
@@ -168,16 +405,44 @@ class QueryProcessor:
           Index: <strategy>, <nodes> nodes visited
           Records: <scanned> scanned, <returned> returned
         """
-        raise NotImplementedError
+        disk_stats = self.disk.get_stats()
+        buf_stats = self.buffer.get_stats()
+        fim_stats = self.file_idx.get_stats()
+
+        hit_rate = buf_stats["hit_rate"] * 100
+
+        lines = [
+            "=== STATISTICS ===",
+            f"Disk I/O: {disk_stats['reads']} reads, {disk_stats['writes']} writes",
+            (
+                f"Buffer Pool: {buf_stats['requests']} requests, "
+                f"{buf_stats['hits']} hits, {buf_stats['misses']} misses "
+                f"({hit_rate:.1f}% hit rate)"
+            ),
+            f"Evictions: {buf_stats['evictions']} ({buf_stats['dirty_writebacks']} dirty writebacks)",
+            f"Index: {fim_stats['index_strategy']}, {fim_stats['index_nodes_visited']} nodes visited",
+            f"Records: {fim_stats['records_scanned']} scanned, {fim_stats['records_returned']} returned",
+        ]
+
+        with open(self._stats_path, "w", encoding="ascii") as f:
+            f.write("\n".join(lines) + "\n")
 
     def _cmd_stats_reset(self) -> None:
         """Reset all layer counters via their reset_stats() methods."""
-        raise NotImplementedError
+        self.disk.reset_stats()
+        self.buffer.reset_stats()
+        self.file_idx.reset_stats()
 
     # ─── Output / log helpers ─────────────────────────────────────────────────
 
     def _write_output(self, text: str) -> None:
-        """Append text (with newline) to output.txt."""
+        """
+        Append text (with newline) to output.txt.
+        In explain mode, captures into _explain_buffer instead.
+        """
+        if self._explain_mode:
+            self._explain_buffer.append(text)
+            return
         with open(self._output_path, "a", encoding="ascii") as f:
             f.write(text + "\n")
 
@@ -186,7 +451,10 @@ class QueryProcessor:
         Append one CSV row to log.csv:
           <unix_timestamp>,<command_string>,<status>
         status is "success" or "failure".
+        Suppressed when called from within _cmd_explain (inner command execution).
         """
+        if self._suppress_log:
+            return
         ts = int(time.time())
         with open(self._log_path, "a", encoding="ascii") as f:
             f.write(f"{ts},{command},{status}\n")
