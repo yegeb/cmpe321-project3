@@ -123,6 +123,15 @@ class FileIndexManager:
         write_res = self.buffer.write_page(type_name, page_id, bytes(data))
         return write_res.status == "success"
 
+    def _cleanup_type_files(self, type_name: str) -> None:
+        """
+        Best-effort cleanup used when create_type fails after allocating files.
+        """
+        self.buffer.drop_file(type_name)
+        index_file_id = self._index_file_id(type_name)
+        if index_file_id:
+            self.buffer.drop_file(index_file_id)
+
     # ─── DDL ─────────────────────────────────────────────────────────────────
 
     def create_type(
@@ -195,6 +204,7 @@ class FileIndexManager:
         first_page = make_page(data_res.page_id, PAGE_TYPE_DATA, self.page_size)
         write_res = self.buffer.write_page(type_name, data_res.page_id, bytes(first_page))
         if write_res.status != "success":
+            self._cleanup_type_files(type_name)
             return TypeResult(success=False, type_name=type_name,
                               status="failure",
                               error_msg="Failed to initialize first data page.")
@@ -203,12 +213,14 @@ class FileIndexManager:
         if self.strategy == "hash_index":
             ok = hash_init(self.buffer, self._index_file_id(type_name), self.page_size)
             if not ok:
+                self._cleanup_type_files(type_name)
                 return TypeResult(success=False, type_name=type_name,
                                   status="failure",
                                   error_msg="Failed to initialize hash index.")
         elif self.strategy == "bplus_tree":
             ok = bplus_init(self.buffer, self._index_file_id(type_name), self.page_size)
             if not ok:
+                self._cleanup_type_files(type_name)
                 return TypeResult(success=False, type_name=type_name,
                                   status="failure",
                                   error_msg="Failed to initialize B+ tree index.")
@@ -216,6 +228,7 @@ class FileIndexManager:
         # Persist to catalog only after data and index initialization succeed.
         ok = save_type_to_catalog(self.buffer, self.page_size, ti)
         if not ok:
+            self._cleanup_type_files(type_name)
             return TypeResult(success=False, type_name=type_name,
                               status="failure",
                               error_msg="Failed to write catalog entry.")

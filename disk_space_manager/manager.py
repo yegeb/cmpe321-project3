@@ -79,6 +79,19 @@ class DiskSpaceManager:
     def _file_path(self, file_id: str) -> str:
         return os.path.join(self._base_dir, f"{file_id}.db")
 
+    def delete_file(self, file_id: str) -> bool:
+        """
+        Best-effort deletion helper used for cleanup of failed type creation.
+        Returns True if the file is absent after the call.
+        """
+        file_path = self._file_path(file_id)
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return True
+        except OSError:
+            return False
+
     def create_file(self, file_id: str) -> bool:
         """
         Create the binary file if it doesn't exist.

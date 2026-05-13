@@ -356,21 +356,38 @@ class BufferManager:
         Write all dirty frames to disk. Called by archive.py at the end of
         every run. After flush all frames are clean (dirty=False).
         """
+        flush_ok = True
         for frame in list(self._frames.values()):
             if not frame.dirty:
                 continue
             write_result = self.disk.write_page(frame.file_id, frame.page_id, frame.data)
             if write_result.success:
                 frame.dirty = False
+            else:
+                flush_ok = False
+        return flush_ok
 
     def flush_file(self, file_id: str) -> None:
         """Write all dirty frames belonging to file_id to disk."""
+        flush_ok = True
         for frame in list(self._frames.values()):
             if frame.file_id != file_id or not frame.dirty:
                 continue
             write_result = self.disk.write_page(frame.file_id, frame.page_id, frame.data)
             if write_result.success:
                 frame.dirty = False
+            else:
+                flush_ok = False
+        return flush_ok
+
+    def drop_file(self, file_id: str) -> bool:
+        """
+        Remove all cached frames for file_id and delete its on-disk file.
+        Used only for cleanup of failed create_type flows.
+        """
+        for key in [key for key in self._frames if key[0] == file_id]:
+            del self._frames[key]
+        return self.disk.delete_file(file_id)
 
     def estimate_data_page_reads(self, file_id: str, page_count: int) -> int:
         """

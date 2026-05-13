@@ -24,7 +24,8 @@ def main():
             if line:
                 qp.process(line)
 
-    buffer.flush()
+    if not buffer.flush():
+        raise RuntimeError("Buffer flush failed.")
 
 
 if __name__ == "__main__":

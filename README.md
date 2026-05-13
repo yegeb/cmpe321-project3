@@ -85,5 +85,5 @@ python3 workload_generator.py --mode random --records 1000 --queries 200 --seed 
 ## Notes
 
 - String values produced by the workload generator are alphanumeric only.
-- The generator always creates a type with 4 fields, including 2 integer fields.
+- The generator always creates a type with 6 fields, including 3 integer fields.
 - `record.txt` contains reproducibility command templates for the required experiments.
